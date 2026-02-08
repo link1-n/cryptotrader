@@ -1,0 +1,11 @@
+{
+  "include": ["src", "examples"],
+  "exclude": ["**/__pycache__", "**/.venv", "**/node_modules"],
+  "extraPaths": ["src"],
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Darwin",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "typeCheckingMode": "standard",
+}
