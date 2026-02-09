@@ -1,9 +1,19 @@
 import asyncio
 import datetime
+import gc
+import os
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+try:
+    import psutil
+
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 from deltatrader.core.engine import TradingEngine
 from deltatrader.models.orderbook import OrderBook
@@ -41,7 +51,12 @@ class MarketDataRecorder(Strategy):
         self.save_interval_seconds = 60  # Save every minute
         self.max_buffer_size = 1000  # Save when buffer reaches this size
 
+        # Memory profiling
+        self._save_count = 0
+        tracemalloc.start()
+
         logger.info(f"MarketDataRecorder initialized. Data dir: {self.data_dir}")
+        logger.info(f"Memory profiling enabled. psutil available: {PSUTIL_AVAILABLE}")
 
     async def on_start(self) -> None:
         """Initialize buffers for each symbol."""
@@ -55,6 +70,9 @@ class MarketDataRecorder(Strategy):
         logger.info("Flushing remaining data before shutdown...")
         await self._save_all_data(force=True)
         logger.info("MarketDataRecorder stopped")
+
+        # Stop memory profiling
+        tracemalloc.stop()
 
     async def on_orderbook_update(self, symbol: str, orderbook: OrderBook) -> None:
         """Record orderbook snapshot."""
@@ -154,8 +172,48 @@ class MarketDataRecorder(Strategy):
                 await self._save_all_data()
                 self.last_save_time = current_time
 
+                # Increment save counter and log memory stats
+                self._save_count += 1
+                if self._save_count % 10 == 0:
+                    self._log_memory_stats()
+
         except Exception as e:
             logger.error(f"Error in on_tick: {e}", exc_info=True)
+
+    def _log_memory_stats(self) -> None:
+        """Log memory usage statistics."""
+        try:
+            # Log process memory (if psutil available)
+            if PSUTIL_AVAILABLE:
+                process = psutil.Process(os.getpid())
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / 1024 / 1024
+                logger.info(f"Process memory: {mem_mb:.1f} MB (RSS)")
+
+            # Log Python memory allocations
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics("lineno")
+
+            logger.info("=" * 60)
+            logger.info(f"Memory Profile (after {self._save_count} saves)")
+            logger.info("=" * 60)
+
+            logger.info("Top 5 memory allocations:")
+            for i, stat in enumerate(top_stats[:5], 1):
+                logger.info(f"  {i}. {stat}")
+
+            # Log buffer sizes
+            total_orderbook_records = sum(
+                len(buf) for buf in self.orderbook_buffers.values()
+            )
+            total_trade_records = sum(len(buf) for buf in self.trade_buffers.values())
+            logger.info(f"Current buffer sizes:")
+            logger.info(f"  Orderbook records: {total_orderbook_records}")
+            logger.info(f"  Trade records: {total_trade_records}")
+            logger.info("=" * 60)
+
+        except Exception as e:
+            logger.error(f"Error logging memory stats: {e}", exc_info=True)
 
     async def _save_all_data(self, force: bool = False) -> None:
         """Save all buffered data to Parquet files concurrently.
@@ -216,27 +274,42 @@ class MarketDataRecorder(Strategy):
 
         By running in a thread pool via asyncio.to_thread(), these blocking
         operations don't block the event loop.
+
+        Handles date boundaries properly by grouping records by date.
         """
-        # Convert to DataFrame
+        if not buffer:
+            return
+
         df = pd.DataFrame(buffer)
 
-        # Generate filename with date
-        date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-        filename = self.data_dir / f"orderbook_{symbol}_{date_str}.parquet"
+        # Group by date to handle midnight boundary correctly
+        df["date"] = pd.to_datetime(df["system_timestamp"]).dt.date
 
-        # Append to existing file or create new one
-        if filename.exists():
-            # Read existing data
-            existing_df = pd.read_parquet(filename)
-            df = pd.concat([existing_df, df], ignore_index=True)
+        for date, group_df in df.groupby("date"):
+            date_str = date.strftime("%Y%m%d")
+            filename = self.data_dir / f"orderbook_{symbol}_{date_str}.parquet"
 
-        # Save to Parquet
-        df.to_parquet(
-            filename,
-            engine="pyarrow",
-            compression="snappy",
-            index=False,
-        )
+            # Remove the temporary date column
+            group_df = group_df.drop("date", axis=1).copy()
+
+            # Append to existing file or create new one
+            if filename.exists():
+                existing_df = pd.read_parquet(filename)
+                group_df = pd.concat([existing_df, group_df], ignore_index=True)
+                del existing_df  # Explicit cleanup to help GC
+
+            # Save to Parquet
+            group_df.to_parquet(
+                filename,
+                engine="pyarrow",
+                compression="snappy",
+                index=False,
+            )
+
+            del group_df  # Explicit cleanup
+
+        del df  # Explicit cleanup
+        gc.collect()  # Suggest garbage collection
 
     async def _save_trade_data(self, symbol: str, force: bool = False) -> None:
         """Save trade data for a symbol to Parquet (async with thread pool)."""
@@ -278,27 +351,42 @@ class MarketDataRecorder(Strategy):
 
         By running in a thread pool via asyncio.to_thread(), these blocking
         operations don't block the event loop.
+
+        Handles date boundaries properly by grouping records by date.
         """
-        # Convert to DataFrame
+        if not buffer:
+            return
+
         df = pd.DataFrame(buffer)
 
-        # Generate filename with date
-        date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-        filename = self.data_dir / f"trades_{symbol}_{date_str}.parquet"
+        # Group by date to handle midnight boundary correctly
+        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
 
-        # Append to existing file or create new one
-        if filename.exists():
-            # Read existing data
-            existing_df = pd.read_parquet(filename)
-            df = pd.concat([existing_df, df], ignore_index=True)
+        for date, group_df in df.groupby("date"):
+            date_str = date.strftime("%Y%m%d")
+            filename = self.data_dir / f"trades_{symbol}_{date_str}.parquet"
 
-        # Save to Parquet
-        df.to_parquet(
-            filename,
-            engine="pyarrow",
-            compression="snappy",
-            index=False,
-        )
+            # Remove the temporary date column
+            group_df = group_df.drop("date", axis=1).copy()
+
+            # Append to existing file or create new one
+            if filename.exists():
+                existing_df = pd.read_parquet(filename)
+                group_df = pd.concat([existing_df, group_df], ignore_index=True)
+                del existing_df  # Explicit cleanup to help GC
+
+            # Save to Parquet
+            group_df.to_parquet(
+                filename,
+                engine="pyarrow",
+                compression="snappy",
+                index=False,
+            )
+
+            del group_df  # Explicit cleanup
+
+        del df  # Explicit cleanup
+        gc.collect()  # Suggest garbage collection
 
 
 async def main():
