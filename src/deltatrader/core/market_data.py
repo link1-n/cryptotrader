@@ -6,6 +6,7 @@ from collections.abc import Callable
 from ..client.websocket import WebSocketClient
 from ..models.orderbook import OrderBook
 from ..models.trade import Trade
+from ..utils.config import Config
 from ..utils.integer_conversion import IntegerConverter
 from ..utils.logger import logger
 
@@ -43,6 +44,10 @@ class MarketDataManager:
         """
         Subscribe to orderbook updates for a symbol.
 
+        Uses the channel configured in Config.ORDERBOOK_CHANNEL:
+        - l2_orderbook: Full L2 snapshots sent periodically
+        - l2_updates: Initial snapshot + incremental updates
+
         Args:
             symbol: Trading symbol (e.g., "BTCUSD")
         """
@@ -51,14 +56,15 @@ class MarketDataManager:
             self._orderbooks[symbol] = OrderBook(symbol=symbol)
             self._pending_snapshots[symbol] = True
 
-        # Subscribe to l2_updates channel
-        channel = f"l2_orderbook.{symbol}"
+        # Subscribe to configured orderbook channel
+        channel_type = Config.ORDERBOOK_CHANNEL
+        channel = f"{channel_type}.{symbol}"
         await self.ws_client.subscribe([channel])
 
         # Add handler for this symbol
         self.ws_client.add_handler(channel, self._handle_orderbook_message)
 
-        logger.info(f"Subscribed to orderbook: {symbol}")
+        logger.info(f"Subscribed to orderbook ({channel_type}): {symbol}")
 
     async def subscribe_trades(self, symbol: str) -> None:
         """
@@ -87,12 +93,15 @@ class MarketDataManager:
         Args:
             symbol: Trading symbol
         """
-        channel = f"l2_orderbook.{symbol}"
+        channel_type = Config.ORDERBOOK_CHANNEL
+        channel = f"{channel_type}.{symbol}"
         await self.ws_client.unsubscribe([channel])
 
         async with self._lock:
             if symbol in self._orderbooks:
                 del self._orderbooks[symbol]
+            if symbol in self._pending_snapshots:
+                del self._pending_snapshots[symbol]
 
         logger.info(f"Unsubscribed from orderbook: {symbol}")
 
@@ -113,13 +122,29 @@ class MarketDataManager:
         logger.info(f"Unsubscribed from trades: {symbol}")
 
     async def _handle_orderbook_message(self, data: dict) -> None:
-        """Handle orderbook update message."""
+        """
+        Handle orderbook update message.
+
+        Supports both l2_orderbook and l2_updates channel formats:
+        - l2_orderbook: Full snapshots with type="l2_orderbook"
+        - l2_updates: Initial snapshot (action="snapshot") + incremental updates (action="update")
+        """
         try:
-            msg_type = data.get("type")
+            logger.debug(f"ORDERBOOKMSG: {data}")
+            # l2_updates messages have BOTH type="l2_updates" AND action="snapshot"/"update"
+            # We need to prioritize the action field for l2_updates messages
+            action = data.get("action")
+            msg_type = action if action else data.get("type")
             symbol = data.get("symbol")
 
             if not symbol:
                 logger.warning("Orderbook message missing symbol")
+                return
+
+            # Handle error messages
+            if msg_type == "error":
+                error_msg = data.get("message", "Unknown error")
+                logger.error(f"Orderbook error for {symbol}: {error_msg}")
                 return
 
             async with self._lock:
@@ -128,35 +153,35 @@ class MarketDataManager:
                     orderbook = OrderBook(symbol=symbol)
                     self._orderbooks[symbol] = orderbook
 
-                # Handle l2_orderbook (full snapshot from Delta Exchange)
+                # Handle l2_orderbook (full snapshot from l2_orderbook channel)
                 if msg_type == "l2_orderbook":
-                    print(data)
                     orderbook.update_from_snapshot(data, self.converter)
                     self._pending_snapshots[symbol] = False
                     best_bid = orderbook.get_best_bid()
                     best_ask = orderbook.get_best_ask()
                     logger.info(
-                        f"Orderbook snapshot: {symbol} - "
+                        f"Orderbook snapshot (l2_orderbook): {symbol} - "
                         f"bid={best_bid[0]}/{best_bid[1]}, "
                         f"ask={best_ask[0]}/{best_ask[1]}, "
                         f"seq={orderbook.sequence_no}, "
                         f"bids={len(orderbook.bids)}, asks={len(orderbook.asks)}"
                     )
 
-                # Handle snapshot (incremental snapshot format)
+                # Handle snapshot (from l2_updates channel or legacy format)
                 elif msg_type == "snapshot":
                     orderbook.update_from_snapshot(data, self.converter)
                     self._pending_snapshots[symbol] = False
                     best_bid = orderbook.get_best_bid()
                     best_ask = orderbook.get_best_ask()
                     logger.info(
-                        f"Orderbook snapshot: {symbol} - "
+                        f"Orderbook snapshot (l2_updates): {symbol} - "
                         f"bid={best_bid[0]}/{best_bid[1]}, "
                         f"ask={best_ask[0]}/{best_ask[1]}, "
-                        f"seq={orderbook.sequence_no}"
+                        f"seq={orderbook.sequence_no}, "
+                        f"bids={len(orderbook.bids)}, asks={len(orderbook.asks)}"
                     )
 
-                # Handle incremental update
+                # Handle incremental update (from l2_updates channel)
                 elif msg_type == "update":
                     # Skip updates until we have a snapshot
                     if self._pending_snapshots.get(symbol, True):
@@ -172,17 +197,45 @@ class MarketDataManager:
                             f"Sequence mismatch for {symbol}, resubscribing for snapshot"
                         )
                         self._pending_snapshots[symbol] = True
-                        await self.ws_client.unsubscribe([f"l2_orderbook.{symbol}"])
+                        channel_type = Config.ORDERBOOK_CHANNEL
+                        channel = f"{channel_type}.{symbol}"
+                        await self.ws_client.unsubscribe([channel])
                         await asyncio.sleep(0.1)
-                        await self.ws_client.subscribe([f"l2_orderbook.{symbol}"])
+                        await self.ws_client.subscribe([channel])
                         return
+
+                    logger.debug(
+                        f"Applied orderbook update: {symbol} seq={orderbook.sequence_no}"
+                    )
+
+                else:
+                    logger.warning(f"Unknown orderbook message type: {msg_type}")
+                    return
 
                 # Validate checksum if provided
                 checksum = data.get("cs")
-                if checksum and not orderbook.validate_checksum(
-                    checksum, self.converter
-                ):
-                    logger.warning(f"Checksum validation failed for {symbol}")
+                if checksum:
+                    computed = orderbook.compute_checksum(self.converter)
+                    if computed != checksum:
+                        # Build checksum string for debugging
+                        top_raw_asks = orderbook._raw_asks[:10]
+                        top_raw_bids = orderbook._raw_bids[:10]
+                        ask_parts = [f"{price}:{size}" for price, size in top_raw_asks]
+                        bid_parts = [f"{price}:{size}" for price, size in top_raw_bids]
+                        checksum_string = (
+                            ",".join(ask_parts) + "|" + ",".join(bid_parts)
+                        )
+
+                        logger.warning(
+                            f"Checksum validation failed for {symbol} "
+                            f"(expected={checksum}, computed={computed})\n"
+                            f"Checksum string: {checksum_string[:200]}..."
+                            if len(checksum_string) > 200
+                            else f"Checksum string: {checksum_string}"
+                        )
+                        # Optionally resubscribe on checksum failure
+                        # self._pending_snapshots[symbol] = True
+                        # await self._resubscribe_orderbook(symbol)
 
             # Notify callbacks
             await self._notify_orderbook_callbacks(symbol, orderbook)
@@ -193,13 +246,21 @@ class MarketDataManager:
     async def _handle_trade_message(self, data: dict) -> None:
         """Handle trade update message."""
         try:
+            logger.debug(f"TRADEMSG: {data}")
             msg_type = data.get("type")
             symbol = data.get("symbol")
-            trades_data = data.get("trades", [])
 
             if not symbol:
                 logger.warning("Trade message missing symbol")
                 return
+
+            # Delta Exchange sends trade data in two formats:
+            # 1. Array format: {"type": "all_trades_snapshot", "trades": [...]}
+            # 2. Single trade: {"type": "all_trades", "price": "...", "size": ..., ...}
+            trades_data = data.get("trades")
+            if trades_data is None:
+                # Single trade message - the data dict itself is the trade
+                trades_data = [data]
 
             async with self._lock:
                 if symbol not in self._trades:
@@ -221,14 +282,9 @@ class MarketDataManager:
                         -self._max_trades_per_symbol :
                     ]
 
-                if msg_type == "all_trades_snapshot":
-                    logger.debug(
-                        f"Trades snapshot received: {symbol} ({len(new_trades)} trades)"
-                    )
-                elif msg_type == "all_trades":
-                    logger.debug(
-                        f"Trade update received: {symbol} ({len(new_trades)} trades)"
-                    )
+                logger.debug(
+                    f"Trades received: {symbol} ({len(new_trades)} trades) ({msg_type} type)"
+                )
 
             # Notify callbacks
             await self._notify_trade_callbacks(symbol, new_trades)

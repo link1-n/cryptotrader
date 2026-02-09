@@ -32,12 +32,24 @@ class WebSocketClient:
         self._message_handlers: dict[str, list[Callable]] = {
             "snapshot": [],
             "update": [],
+            "error": [],  # For l2_updates error messages
             "l2_orderbook": [],
             "all_trades": [],
             "all_trades_snapshot": [],
             "ticker": [],
             "subscriptions": [],
             "heartbeat": [],
+            # Order update message types
+            "order_created": [],
+            "order_open": [],
+            "order_cancelled": [],
+            "order_closed": [],
+            "order_rejected": [],
+            "orders": [],  # Generic order updates
+            "fill": [],
+            "fills": [],  # Generic fills
+            "position_update": [],
+            "positions": [],  # Generic position updates
         }
 
         # Heartbeat tracking
@@ -215,14 +227,38 @@ class WebSocketClient:
                 asyncio.create_task(handler(data))
             return
 
-        # Handle l2_updates (snapshot and update) - for incremental updates
-        if msg_type in ["snapshot", "update"]:
+        # Handle l2_updates messages - check 'action' field for snapshot/update/error
+        action = data.get("action")
+        if action in ["snapshot", "update", "error"]:
             symbol = data.get("symbol")
             if symbol:
-                channel_key = f"l2_orderbook.{symbol}"
+                # Try l2_updates channel first, then fall back to l2_orderbook
+                channel_key = f"l2_updates.{symbol}"
                 if channel_key in self._channel_handlers:
                     for handler in self._channel_handlers[channel_key]:
                         asyncio.create_task(handler(data))
+                else:
+                    # Fallback for backward compatibility
+                    channel_key = f"l2_orderbook.{symbol}"
+                    if channel_key in self._channel_handlers:
+                        for handler in self._channel_handlers[channel_key]:
+                            asyncio.create_task(handler(data))
+
+            # Also call generic handlers using action as message type
+            for handler in self._message_handlers.get(action, []):
+                asyncio.create_task(handler(data))
+            return
+
+        # Handle legacy snapshot/update messages with 'type' field (for backward compatibility)
+        if msg_type in ["snapshot", "update"]:
+            symbol = data.get("symbol")
+            if symbol:
+                # Try both channel types
+                for channel_prefix in ["l2_updates", "l2_orderbook"]:
+                    channel_key = f"{channel_prefix}.{symbol}"
+                    if channel_key in self._channel_handlers:
+                        for handler in self._channel_handlers[channel_key]:
+                            asyncio.create_task(handler(data))
 
             # Also call generic handlers
             for handler in self._message_handlers.get(msg_type, []):
@@ -265,6 +301,43 @@ class WebSocketClient:
                         asyncio.create_task(handler(data))
 
             for handler in self._message_handlers.get("ticker", []):
+                asyncio.create_task(handler(data))
+            return
+
+        # Handle order updates
+        if msg_type in [
+            "order_created",
+            "order_open",
+            "order_cancelled",
+            "order_closed",
+            "order_rejected",
+        ]:
+            # Call order-specific handlers
+            for handler in self._message_handlers.get(msg_type, []):
+                asyncio.create_task(handler(data))
+
+            # Also call generic order handlers
+            for handler in self._message_handlers.get("orders", []):
+                asyncio.create_task(handler(data))
+            return
+
+        # Handle fill updates
+        if msg_type == "fill":
+            for handler in self._message_handlers.get("fill", []):
+                asyncio.create_task(handler(data))
+
+            # Also call generic fills handlers
+            for handler in self._message_handlers.get("fills", []):
+                asyncio.create_task(handler(data))
+            return
+
+        # Handle position updates
+        if msg_type == "position_update":
+            for handler in self._message_handlers.get("position_update", []):
+                asyncio.create_task(handler(data))
+
+            # Also call generic position handlers
+            for handler in self._message_handlers.get("positions", []):
                 asyncio.create_task(handler(data))
             return
 
@@ -347,6 +420,72 @@ class WebSocketClient:
             }
             await self._send_message(unsub_message)
             logger.info(f"Unsubscribed from channels: {channels}")
+
+    async def subscribe_orders(self) -> None:
+        """
+        Subscribe to order updates (requires authentication).
+
+        This provides real-time order status updates via WebSocket.
+        """
+        if not self._authenticated:
+            logger.warning("WebSocket not authenticated, authenticating first...")
+            await self._authenticate()
+
+        if not self._authenticated:
+            logger.error("Cannot subscribe to orders: authentication failed")
+            return
+
+        # Subscribe to orders channel
+        sub_message = {
+            "type": "subscribe",
+            "payload": {"channels": [{"name": "orders"}]},
+        }
+        await self._send_message(sub_message)
+        logger.info("Subscribed to order updates")
+
+    async def subscribe_fills(self) -> None:
+        """
+        Subscribe to fill updates (requires authentication).
+
+        This provides detailed fill/trade information via WebSocket.
+        """
+        if not self._authenticated:
+            logger.warning("WebSocket not authenticated, authenticating first...")
+            await self._authenticate()
+
+        if not self._authenticated:
+            logger.error("Cannot subscribe to fills: authentication failed")
+            return
+
+        # Subscribe to fills channel
+        sub_message = {
+            "type": "subscribe",
+            "payload": {"channels": [{"name": "fills"}]},
+        }
+        await self._send_message(sub_message)
+        logger.info("Subscribed to fill updates")
+
+    async def subscribe_positions(self) -> None:
+        """
+        Subscribe to position updates (requires authentication).
+
+        This provides real-time position and PnL updates via WebSocket.
+        """
+        if not self._authenticated:
+            logger.warning("WebSocket not authenticated, authenticating first...")
+            await self._authenticate()
+
+        if not self._authenticated:
+            logger.error("Cannot subscribe to positions: authentication failed")
+            return
+
+        # Subscribe to positions channel
+        sub_message = {
+            "type": "subscribe",
+            "payload": {"channels": [{"name": "positions"}]},
+        }
+        await self._send_message(sub_message)
+        logger.info("Subscribed to position updates")
 
     async def _resubscribe_all(self) -> None:
         """Resubscribe to all channels after reconnection."""

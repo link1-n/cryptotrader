@@ -25,8 +25,16 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.9.0",
+    "pandas>=2.3.3",
+    "pyarrow>=23.0.0",
     "pydantic>=2.5.0",
     "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+data-recording = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
 ]
 
 [project.urls]

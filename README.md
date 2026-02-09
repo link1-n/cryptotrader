@@ -44,6 +44,14 @@ DELTA_API_SECRET=your_api_secret_here
 
 # Environment (optional, defaults to "production")
 DELTA_ENVIRONMENT=testnet  # or "production" for live trading
+
+# Order Destination (optional, defaults to "paper")
+ORDER_DESTINATION=paper  # or "exchange" for live trading
+
+# Orderbook Channel (optional, defaults to "l2_orderbook")
+# l2_orderbook: Full L2 snapshots sent periodically (max 20 symbols per connection)
+# l2_updates: Initial snapshot + incremental updates (max 100 symbols per connection)
+ORDERBOOK_CHANNEL=l2_updates  # or "l2_orderbook" for periodic full snapshots
 ```
 
 ## Quick Start

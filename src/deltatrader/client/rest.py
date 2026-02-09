@@ -319,27 +319,52 @@ class RestClient:
     async def edit_order(
         self,
         order_id: str,
+        product_id: int | None = None,
+        product_symbol: str | None = None,
         size: int | None = None,
         limit_price: str | None = None,
+        stop_price: str | None = None,
+        trail_amount: str | None = None,
+        mmp: str | None = None,
+        post_only: bool | None = None,
     ) -> dict[str, Any]:
         """
-        Edit an existing order.
+        Edit an existing order according to Delta Exchange API specification.
 
         Args:
-            order_id: Order ID to edit
-            size: New size (contracts)
+            order_id: Order ID to edit (required)
+            product_id: Product ID (either product_id or product_symbol must be sent)
+            product_symbol: Product symbol (either product_id or product_symbol must be sent)
+            size: Total size after editing order
             limit_price: New limit price
+            stop_price: Price to trigger stop order
+            trail_amount: Trail amount for trailing stop orders
+            mmp: MMP level for the order (disabled/mmp1/mmp2/mmp3/mmp4/mmp5)
+            post_only: Post only order flag
 
         Returns:
             Updated order data
         """
-        payload = {}
+        payload = {"id": int(order_id)}
+
+        if product_id is not None:
+            payload["product_id"] = product_id
+        if product_symbol is not None:
+            payload["product_symbol"] = product_symbol
         if size is not None:
             payload["size"] = size
         if limit_price is not None:
             payload["limit_price"] = limit_price
+        if stop_price is not None:
+            payload["stop_price"] = stop_price
+        if trail_amount is not None:
+            payload["trail_amount"] = trail_amount
+        if mmp is not None:
+            payload["mmp"] = mmp
+        if post_only is not None:
+            payload["post_only"] = post_only
 
-        response = await self._request("PUT", f"/v2/orders/{order_id}", data=payload)
+        response = await self._request("PUT", "/v2/orders", data=payload)
         logger.info(f"Order edited: {order_id}")
         return response.get("result", {})
 

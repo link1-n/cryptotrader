@@ -21,6 +21,9 @@ class PaperOrderManager(OrderManager):
         super().__init__(converter)
         self._order_counter = 0
         self._simulated_latency = 0.05  # 50ms simulated latency
+        self._reconciliation_task: asyncio.Task | None = None
+        self._reconciliation_interval = 30  # seconds
+        self._running = False
 
     async def place_order(self, order: Order) -> Order:
         """
@@ -165,3 +168,123 @@ class PaperOrderManager(OrderManager):
                 return True
 
         return False
+
+    async def edit_order(
+        self,
+        client_order_id: str,
+        new_size: int | None = None,
+        new_price: int | None = None,
+    ) -> Order | None:
+        """
+        Edit an existing order in-place using Delta Exchange's native edit_order API.
+
+        This modifies the order without cancelling it, preserving queue position.
+        Delta Exchange supports editing size and limit_price for open orders.
+
+        Args:
+            client_order_id: Order ID to edit
+            new_size: New size (contracts), None to keep existing
+            new_price: New price (integer), None to keep existing
+
+        Returns:
+            Updated order if successful, None otherwise
+        """
+        # Simulate network latency
+        await asyncio.sleep(self._simulated_latency)
+
+        # Get the existing order
+        order = self.get_order(client_order_id)
+        if not order:
+            logger.error(f"[PAPER] Order not found for edit: {client_order_id}")
+            return None
+
+        # Check if order is still open
+        if order.status not in ["open", "pending"]:
+            logger.error(
+                f"[PAPER] Cannot edit order {client_order_id}: status is {order.status}"
+            )
+            return None
+
+        # Use existing values if not specified
+        size = new_size if new_size is not None else order.size
+        price = new_price if new_price is not None else order.price
+
+        # Check if anything actually changed
+        if size == order.size and price == order.price:
+            logger.info(
+                f"[PAPER] No changes for order {client_order_id}, skipping edit"
+            )
+            return order
+
+        logger.info(
+            f"[PAPER] Editing order {client_order_id}: "
+            f"size {order.size}->{size}, price {order.price}->{price}"
+        )
+
+        # Update order in place (paper trading advantage - instant edit)
+        order.size = size
+        order.price = price
+        order.timestamp = get_timestamp_us()
+
+        logger.info(f"[PAPER] Order edited successfully: {client_order_id}")
+        return order
+
+    async def start_reconciliation(self) -> None:
+        """Start periodic order reconciliation."""
+        if self._running:
+            logger.warning("[PAPER] Order reconciliation already running")
+            return
+
+        self._running = True
+        self._reconciliation_task = asyncio.create_task(self._reconciliation_loop())
+        logger.info(
+            f"[PAPER] Started order reconciliation (interval: {self._reconciliation_interval}s)"
+        )
+
+    async def stop_reconciliation(self) -> None:
+        """Stop periodic order reconciliation."""
+        if not self._running:
+            return
+
+        logger.info("[PAPER] Stopping order reconciliation...")
+        self._running = False
+
+        if self._reconciliation_task:
+            self._reconciliation_task.cancel()
+            try:
+                await self._reconciliation_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("[PAPER] Order reconciliation stopped")
+
+    async def _reconciliation_loop(self) -> None:
+        """Periodic reconciliation loop."""
+        try:
+            while self._running:
+                await asyncio.sleep(self._reconciliation_interval)
+
+                try:
+                    stats = await self.reconcile_orders()
+                    logger.debug(f"[PAPER] Reconciliation stats: {stats}")
+                except Exception as e:
+                    logger.error(
+                        f"[PAPER] Error in reconciliation loop: {e}", exc_info=True
+                    )
+
+        except asyncio.CancelledError:
+            logger.debug("[PAPER] Reconciliation loop cancelled")
+
+    def set_reconciliation_interval(self, interval: int) -> None:
+        """
+        Set the reconciliation interval.
+
+        Args:
+            interval: Interval in seconds (minimum 5)
+        """
+        if interval < 5:
+            logger.warning("[PAPER] Reconciliation interval must be at least 5 seconds")
+            interval = 5
+
+        self._reconciliation_interval = interval
+        logger.info(f"[PAPER] Reconciliation interval set to {interval}s")

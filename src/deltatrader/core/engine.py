@@ -41,7 +41,9 @@ class TradingEngine:
             self.order_manager: OrderManager = PaperOrderManager(self.converter)
             logger.info("Using PaperOrderManager for demo mode")
         elif Config.ORDER_DESTINATION == "exchange":
-            self.order_manager = LiveOrderManager(self.rest_client, self.converter)
+            self.order_manager = LiveOrderManager(
+                self.rest_client, self.converter, self.ws_client
+            )
             logger.info("Using LiveOrderManager for live trading")
         else:
             raise ValueError("Invalid Configuration - set order destination")
@@ -122,6 +124,10 @@ class TradingEngine:
             await self.market_data.subscribe_trades(symbol)
             logger.info(f"Subscribed to market data for {symbol}")
 
+        # Subscribe to order updates if using live trading
+        if isinstance(self.order_manager, LiveOrderManager):
+            await self.order_manager.start_order_subscriptions()
+
     async def start(self) -> None:
         """Start the trading engine and all strategies."""
         if self._running:
@@ -137,6 +143,9 @@ class TradingEngine:
 
         # Start tick loop
         self._tick_task = asyncio.create_task(self._tick_loop())
+
+        # Start order reconciliation (as backup/risk check if WebSocket active)
+        await self.order_manager.start_reconciliation()
 
         logger.info("Trading engine started")
 
@@ -159,6 +168,13 @@ class TradingEngine:
         # Stop all strategies
         for strategy in self.strategies:
             await strategy.stop()
+
+        # Stop order subscriptions if using live trading
+        if isinstance(self.order_manager, LiveOrderManager):
+            await self.order_manager.stop_order_subscriptions()
+
+        # Stop order reconciliation
+        await self.order_manager.stop_reconciliation()
 
         # Cancel all orders
         logger.info("Cancelling all open orders...")
@@ -297,6 +313,28 @@ class TradingEngine:
             )
 
         return summary
+
+    def get_order_update_statistics(self) -> dict:
+        """
+        Get order update statistics.
+
+        Returns:
+            Dictionary with order update statistics including WebSocket
+            and reconciliation metrics
+        """
+        if isinstance(self.order_manager, LiveOrderManager):
+            stats = self.order_manager.get_statistics()
+            stats["order_destination"] = "exchange"
+            return stats
+        else:
+            return {
+                "order_destination": "paper",
+                "ws_order_updates": 0,
+                "ws_fill_updates": 0,
+                "reconciliation_discrepancies": 0,
+                "ws_subscribed": False,
+                "reconciliation_interval": 30,
+            }
 
     async def __aenter__(self):
         """Context manager entry."""

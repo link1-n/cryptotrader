@@ -1,7 +1,7 @@
 """Configuration management."""
 
 import os
-from typing import Literal
+from typing import Literal, cast
 
 from dotenv import load_dotenv
 
@@ -24,6 +24,11 @@ class Config:
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # Orderbook channel: ['l2_orderbook', 'l2_updates']
+    # l2_orderbook: Full L2 snapshots sent periodically (max 20 symbols per connection)
+    # l2_updates: Initial snapshot + incremental updates (max 100 symbols per connection)
+    ORDERBOOK_CHANNEL: str = os.getenv("ORDERBOOK_CHANNEL", "l2_orderbook")
 
     # WebSocket URLs
     WS_PRODUCTION_URL = "wss://socket.india.delta.exchange"

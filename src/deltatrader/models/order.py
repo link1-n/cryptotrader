@@ -8,7 +8,9 @@ from ..utils.timing import get_timestamp_us
 
 OrderSide = Literal["buy", "sell"]
 OrderType = Literal["limit_order", "market_order"]
-OrderStatus = Literal["pending", "open", "filled", "cancelled", "rejected"]
+OrderStatus = Literal[
+    "pending", "open", "partially_filled", "filled", "cancelled", "rejected"
+]
 
 
 @dataclass
@@ -90,9 +92,10 @@ class Order:
     @staticmethod
     def _map_status(api_status: str) -> OrderStatus:
         """Map API status to internal status."""
-        status_map = {
+        status_map: dict[str, OrderStatus] = {
             "open": "open",
             "pending": "pending",
+            "partially_filled": "partially_filled",
             "closed": "filled",
             "cancelled": "cancelled",
             "rejected": "rejected",
@@ -110,7 +113,6 @@ class Order:
             f"product_id={self.product_id}, "
             f"client_order_id={self.client_order_id!r}, "
             f"exchange_order_id={self.exchange_order_id!r}, "
-            f"client_order_id={self.client_order_id!r}, "
             f"status={self.status!r}, "
             f"filled_size={self.filled_size}, "
             f"average_fill_price={self.average_fill_price}, "

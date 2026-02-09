@@ -252,6 +252,28 @@ class Strategy(ABC):
         """
         return await self.order_manager.cancel_all_orders(symbol)
 
+    async def edit_order(
+        self,
+        client_order_id: str,
+        new_size: int | None = None,
+        new_price: int | None = None,
+    ) -> Order | None:
+        """
+        Edit an existing order in-place using Delta Exchange's native edit_order API.
+
+        This modifies the order without cancelling it, preserving queue position.
+        Delta Exchange supports editing size and limit_price for open orders.
+
+        Args:
+            client_order_id: Order ID to edit
+            new_size: New size (contracts), None to keep existing
+            new_price: New price (integer), None to keep existing
+
+        Returns:
+            Updated order if successful, None otherwise
+        """
+        return await self.order_manager.edit_order(client_order_id, new_size, new_price)
+
     def get_best_bid(self, symbol: str) -> int | None:
         """
         Get best bid price as integer.
