@@ -61,16 +61,24 @@ class WebSocketClient:
         self._receive_task: asyncio.Task | None = None
         self._connect_event = asyncio.Event()
 
-    async def connect(self, authenticate: bool = True) -> None:
+    async def connect(self, authenticate: bool = True, reconnect: bool = False) -> None:
         """
         Connect to WebSocket.
 
         Args:
             authenticate: Whether to authenticate after connecting
+            reconnect: Whether this is a reconnection attempt
         """
-        if self._running:
+        if self._running and not reconnect:
             logger.warning("WebSocket already connected")
             return
+
+        # Clean up existing connection if reconnecting
+        if reconnect:
+            if self.ws and not self.ws.closed:
+                await self.ws.close()
+            self._running = False
+            self._connect_event.clear()
 
         try:
             if self.session is None or self.session.closed:
@@ -100,13 +108,14 @@ class WebSocketClient:
             await self._resubscribe_all()
 
         except Exception as e:
-            logger.error(f"WebSocket connection failed: {e}")
+            logger.error(f"WebSocket connection failed: {e}", exc_info=True)
             self._running = False
+            logger.warning("WebSocket connection error, scheduling reconnect")
             await self._schedule_reconnect()
 
     async def disconnect(self) -> None:
         """Disconnect from WebSocket."""
-        logger.info("Disconnecting WebSocket")
+        logger.info("WebSocket disconnect initiated by client")
         self._running = False
         self._connect_event.clear()
 
@@ -132,7 +141,9 @@ class WebSocketClient:
 
         # Close WebSocket
         if self.ws and not self.ws.closed:
+            logger.info("Closing WebSocket connection")
             await self.ws.close()
+            logger.info("WebSocket connection closed")
 
         # Close session properly
         if self.session and not self.session.closed:
@@ -179,19 +190,27 @@ class WebSocketClient:
                         logger.error(f"Error handling message: {e}")
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"WebSocket error: {self.ws.exception()}")
+                    ws_exception = self.ws.exception()
+                    logger.error(f"WebSocket error received: {ws_exception}")
+                    logger.error(f"WebSocket error type: {type(ws_exception).__name__}")
                     break
 
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.warning("WebSocket closed by server")
+                    close_code = self.ws.close_code if self.ws else None
+                    logger.warning(
+                        f"WebSocket closed by server (close_code={close_code})"
+                    )
                     break
 
         except asyncio.CancelledError:
             logger.debug("Receive loop cancelled")
         except Exception as e:
-            logger.error(f"Receive loop error: {e}")
+            logger.error(f"Receive loop error: {e}", exc_info=True)
         finally:
             if self._running:
+                logger.warning(
+                    "WebSocket receive loop ended unexpectedly, scheduling reconnect"
+                )
                 await self._schedule_reconnect()
 
     async def _handle_message(self, data: dict[str, Any]) -> None:
@@ -550,14 +569,17 @@ class WebSocketClient:
                     time_since_heartbeat = current_time - self._last_heartbeat
                     if time_since_heartbeat > 120:  # No heartbeat for 2 minutes
                         logger.warning(
-                            f"No heartbeat received for {time_since_heartbeat:.0f}s, reconnecting"
+                            f"WebSocket heartbeat timeout: no heartbeat received for {time_since_heartbeat:.0f}s, initiating reconnect"
                         )
                         await self._schedule_reconnect()
                         break
 
                 # Check if WebSocket is still open
                 if self.ws and self.ws.closed:
-                    logger.warning("WebSocket closed unexpectedly, reconnecting")
+                    close_code = self.ws.close_code if self.ws else None
+                    logger.warning(
+                        f"WebSocket detected as closed unexpectedly (close_code={close_code}), initiating reconnect"
+                    )
                     await self._schedule_reconnect()
                     break
 
@@ -567,11 +589,12 @@ class WebSocketClient:
     async def _schedule_reconnect(self) -> None:
         """Schedule a reconnection attempt."""
         if not self._running:
+            logger.warning("WebSocket reconnect skipped: client not running")
             return
 
         if self._reconnect_attempts >= self._max_reconnect_attempts:
             logger.error(
-                f"Max reconnection attempts ({self._max_reconnect_attempts}) reached"
+                f"WebSocket reconnect failed: max reconnection attempts ({self._max_reconnect_attempts}) reached, giving up"
             )
             self._running = False
             return
@@ -580,14 +603,19 @@ class WebSocketClient:
         delay = Config.WS_RECONNECT_DELAY * self._reconnect_attempts
 
         logger.info(
-            f"Reconnecting in {delay}s (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+            f"WebSocket reconnect scheduled: attempting in {delay}s (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
         )
 
         await asyncio.sleep(delay)
 
-        # Check if still running and not already connected
-        if self._running and (not self.ws or self.ws.closed):
-            await self.connect(authenticate=True)
+        # Check if still should reconnect (ws is closed or doesn't exist)
+        if not self.ws or self.ws.closed:
+            logger.info(
+                f"WebSocket reconnect starting: attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}"
+            )
+            await self.connect(authenticate=True, reconnect=True)
+        else:
+            logger.info("WebSocket reconnect cancelled: connection already restored")
 
     async def wait_connected(self, timeout: float = 10.0) -> bool:
         """
